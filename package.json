@@ -1,0 +1,25 @@
+{
+	"name": "pi-token-stats",
+	"version": "0.1.0",
+	"description": "Live token and throughput stats for pi: prefill/generation timings, tokens per second, and cache usage",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"tokens",
+		"stats",
+		"throughput",
+		"tokens-per-second"
+	],
+	"license": "MIT",
+	"author": "Nicola Lamacchia",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/nicolalamacchia/pi-token-stats.git"
+	},
+	"pi": {
+		"extensions": ["./extensions/token-stats.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
