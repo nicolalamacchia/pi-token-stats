@@ -96,7 +96,7 @@ run `/reload` after editing it.
 {
   "currency": "EUR",
   "fxCacheMinutes": 60,
-  "persistence": { "enabled": true },
+  "persistence": { "enabled": true, "lines": true },
   "providers": {
     "deepseek": {
       "balance": {
@@ -149,6 +149,13 @@ session spend and the last balance per provider in
 every message and on shutdown. Sessions idle for more than 30 days are pruned;
 the file keeps at most 100 sessions.
 
+`persistence.lines` also writes each message and agent line into the session
+as a custom entry (`token-stats-line`), excluded from the model context. Live
+output still comes from the notification only: an entry stays hidden in the
+runtime that wrote it. A later runtime (reload, resume) has a different id and
+renders the entry in place, so lines lost to a reload return to the
+transcript. Entries need a persisted session and interactive mode to render.
+
 DeepSeek prices and peak windows are from
 [api-docs.deepseek.com](https://api-docs.deepseek.com/quick_start/pricing):
 peak is 01:00–04:00 and 06:00–10:00 UTC, Monday to Friday, excluding Chinese
@@ -159,6 +166,8 @@ the API already returns CNY.
 ## Behaviour
 
 - No persistence, commands, widgets, or custom renderer.
+  Exception: with `persistence.lines`, message/agent lines are stored as session
+  entries and drawn by an entry renderer (not sent to the model).
 - Works with every provider pi normalizes (OpenAI, Anthropic, Google, Mistral, Bedrock, local models).
 - Live progress is only shown when the UI is available.
 - Emits a `token_stats:complete` event on pi's event bus after every assistant message, with message, session, and agent totals. Other extensions can subscribe to it:
