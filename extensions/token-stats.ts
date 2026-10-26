@@ -15,12 +15,12 @@
  * - Optionally persists session spend and balance across reloads
  *
  * Message format:
- * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) off-peak
+ * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) off-peak · 💰 $1.68 (€1.50)
  *
  * Agent-end notify format:
  * <last message stats>
  *
- * Agent ✓ 20.1s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · €0.0047
+ * Agent ✓ 20.1s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) · 💰 $1.68 (€1.50)
  *
  * Footer line (configured providers only):
  * 💰 deepseek $1.67 (€1.59) · 💸 €0.081 · off-peak
@@ -146,6 +146,8 @@ interface BalanceConfig {
   emoji?: string;
   /** Label before the session spend in the footer; defaults to 💸. */
   spentLabel?: string;
+  /** Append the balance to the message and agent notify lines. */
+  showInMessages?: boolean;
 }
 
 interface ProviderConfig {
@@ -461,8 +463,6 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   let prevCacheReadTokens = 0;
   let prevCacheWriteTokens = 0;
 
-  let statusRefreshing = false;
-  let statusRefreshQueued = false;
   let configWarningShown = false;
 
   let statePath: string | null = null;
@@ -675,47 +675,27 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     ctx.ui.setStatus(STATUS_KEY, label + chunks.join(separator));
   }
 
-  /** Refresh balance + FX, then redraw the footer line. Coalesces concurrent calls. */
-  function refreshStatus(ctx: ExtensionContext) {
+  /** Fetch balance + FX, persist, then redraw the footer line. */
+  async function refreshBalance(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
 
-    if (statusRefreshing) {
-      statusRefreshQueued = true;
-      return;
-    }
-
     const balanceConfig = config?.providers?.[activeProvider]?.balance;
-    if (!config || !balanceConfig) {
-      setStatusLine(ctx);
-      return;
+    if (!config || !balanceConfig) return;
+
+    const provider = activeProvider;
+    const displayCurrency = config.currency;
+
+    const balance = await fetchBalance(balanceConfig);
+    if (balance) {
+      balances.set(provider, balance);
+      saveState(ctx);
+
+      const shownCurrency = balanceConfig.currency || balance.currency;
+      await getRate(balance.currency, shownCurrency);
+      await getRate(shownCurrency, displayCurrency);
     }
 
-    const displayCurrency = config.currency;
-    statusRefreshing = true;
-    const provider = activeProvider;
-
-    void (async () => {
-      try {
-        do {
-          statusRefreshQueued = false;
-
-          const balance = await fetchBalance(balanceConfig);
-          if (balance) {
-            balances.set(provider, balance);
-            saveState(ctx);
-          }
-
-          if (balance) {
-            const shownCurrency = balanceConfig.currency || balance.currency;
-            await getRate(balance.currency, shownCurrency);
-            await getRate(shownCurrency, displayCurrency);
-          }
-        } while (statusRefreshQueued);
-      } finally {
-        statusRefreshing = false;
-        setStatusLine(ctx);
-      }
-    })();
+    setStatusLine(ctx);
   }
 
   // ── Persistence ──────────────────────────────────────────────────────────
@@ -1028,11 +1008,15 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
     resetWorkingIndicator(ctx);
 
+    if (config?.providers?.[activeProvider]?.balance?.showInMessages) {
+      await refreshBalance(ctx);
+    } else {
+      setStatusLine(ctx);
+      void refreshBalance(ctx);
+    }
+
     lastMessageNotifyText = renderFinalPlain(finalStats);
     ctx.ui.notify(lastMessageNotifyText, "info");
-
-    setStatusLine(ctx);
-    refreshStatus(ctx);
   });
 
   // ── Session lifecycle ────────────────────────────────────────────────────
@@ -1064,7 +1048,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
     resetWorkingIndicator(ctx);
     setStatusLine(ctx);
-    refreshStatus(ctx);
+    void refreshBalance(ctx);
   });
 
   pi.on("turn_start", (_event, ctx) => {
@@ -1169,11 +1153,33 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     return tier ? `${amount} ${tier}` : amount;
   }
 
+  /** Balance for notify lines, or "" when `balance.showInMessages` is off. */
+  function lineBalance(): string {
+    const providerConfig = config?.providers?.[activeProvider];
+    const balance = balances.get(activeProvider);
+    if (!config || !providerConfig?.balance?.showInMessages || !balance) return "";
+
+    const shown = providerConfig.balance.currency || balance.currency;
+    const primary = convert(balance.total, balance.currency, shown);
+    if (primary == null) return "";
+
+    const secondary = convert(primary, shown, config.currency);
+    const label = providerConfig.balance.emoji ? `${providerConfig.balance.emoji} ` : "bal ";
+    const value = `${label}${formatMoney(primary, shown, 2)}`;
+
+    return secondary == null
+      ? value
+      : `${value} (${formatMoney(secondary, config.currency, 2)})`;
+  }
+
   function renderFinalPlain(stats: FinalStats): string {
     let spendSuffix = "";
     if (stats.spend != null) {
       spendSuffix = ` · ${formatSpendLine(stats.spend, true, false, stats.tier)}`;
     }
+
+    const balance = lineBalance();
+    if (balance) spendSuffix += ` · ${balance}`;
 
     return [
       stats.model,
@@ -1199,7 +1205,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   function renderAgentPlain(stats: AgentStats): string {
     const suffixes = [
-      stats.spend == null ? "" : formatSpend(stats.spend, null),
+      stats.spend == null ? "" : formatSpendCents(stats.spend, true),
+      lineBalance(),
       stats.messages > 1 ? `${stats.messages} responses` : "",
     ].filter(Boolean);
     const suffix = suffixes.length > 0 ? ` · ${suffixes.join(" · ")}` : "";

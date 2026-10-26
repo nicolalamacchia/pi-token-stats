@@ -66,14 +66,16 @@ Message and agent lines carry their own spend, in the display currency:
 
 ```text
 deepseek-flash … 4.1s (↑2.9s + ↓1.2s) · ↓512 @ 126.8/s · ~0.03¢
-deepseek-flash ✓ 4.4s (↑2.9s + ↓1.5s) · ↑42.1k @ 14.5k/s · ↓512 @ 341.3/s · Cache R38.0k W0 · 0.07¢ (€0.001) off-peak
-Agent deepseek-flash ✓ 9.0s (↑5.8s + ↓3.2s) · ↑84.2k @ 14.5k/s · ↓1.0k @ 318.7/s · Cache R76.0k W0 · €0.003
+deepseek-flash ✓ 4.4s (↑2.9s + ↓1.5s) · ↑42.1k @ 14.5k/s · ↓512 @ 341.3/s · Cache R38.0k W0 · 0.07¢ (€0.001) off-peak · 💰 $1.68 (€1.50)
+Agent deepseek-flash ✓ 9.0s (↑5.8s + ↓3.2s) · ↑84.2k @ 14.5k/s · ↓1.0k @ 318.7/s · Cache R76.0k W0 · 0.07¢ (€0.001) · 💰 $1.68 (€1.50)
 ```
 
 - live line — `~` estimate from the previous prefill plus the output streamed
   so far (input usage is only known when the message ends)
 - message line — exact spend of that message
 - agent line — exact spend of the whole agent run
+- `💰 $1.68 (€1.50)` — balance after the message, when
+  `balance.showInMessages` is on; keeps a balance history in the transcript
 - `peak` / `off-peak` — time tier applied to the message price
 
 Spend below 0.1 in the display currency is rendered in cents (`0.07¢`); the
@@ -105,7 +107,8 @@ run `/reload` after editing it.
         "low": 2,
         "critical": 1,
         "emoji": "💰",
-        "spentLabel": "💸"
+        "spentLabel": "💸",
+        "showInMessages": true
       },
       "spending": {
         "enabled": true,
@@ -136,6 +139,9 @@ the process environment. `balance.currency` is the currency shown first
 `balance.critical` set the warning and error thresholds. `balance.emoji` adds
 an optional emoji before the provider name in the footer, and
 `balance.spentLabel` sets the label before the session spend (default `💸`).
+`balance.showInMessages` appends the balance to the message and agent lines;
+the balance is fetched after the message finishes, so each line records the
+value right after that response.
 
 `persistence` is off by default. When enabled, the extension keeps the
 session spend and the last balance per provider in
