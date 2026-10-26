@@ -10,18 +10,28 @@
  * - Shows live progress through ctx.ui.setWorkingIndicator()
  * - Shows finalized message stats through ctx.ui.notify()
  * - Shows finalized agent stats on agent_end through ctx.ui.notify()
+ * - Shows provider balance in the footer through ctx.ui.setStatus()
+ * - Shows spend on the live, message, and agent stats lines
+ * - Optionally persists session spend and balance across reloads
  *
  * Message format:
- * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0
+ * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) off-peak
  *
  * Agent-end notify format:
  * <last message stats>
  *
- * Agent ✓ 20.1s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0
+ * Agent ✓ 20.1s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · €0.0047
+ *
+ * Footer line (configured providers only):
+ * 💰 deepseek $1.67 (€1.59) · 💸 €0.081 · off-peak
  *
  * Usage:
  * pi -e ./token-stats.ts
  */
+
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import type {
   ExtensionAPI,
@@ -36,6 +46,9 @@ interface LiveStats {
   generationTimeMs: number;
   estimatedOutputTokens: number;
   generationTokensPerSecond: number;
+  /** Estimated spend of the in-flight message, in the display currency. */
+  spend: number | null;
+  tier: "peak" | "off-peak" | null;
 }
 
 interface FinalStats {
@@ -56,6 +69,9 @@ interface FinalStats {
   totalTokens: number;
   costTotal: number;
   stopReason: string;
+  /** Message spend in the display currency, null when not priced. */
+  spend: number | null;
+  tier: "peak" | "off-peak" | null;
 }
 
 interface AgentStats {
@@ -76,6 +92,8 @@ interface AgentStats {
   totalTokens: number;
   costTotal: number;
   messages: number;
+  /** Agent-run spend in the display currency, null when not priced. */
+  spend: number | null;
 }
 
 interface SessionTotals {
@@ -86,6 +104,97 @@ interface SessionTotals {
   cacheWriteTokens: number;
   totalTokens: number;
   costTotal: number;
+}
+
+interface ModelPrice {
+  /** Price per 1M cache-hit input tokens (peak rate). */
+  cacheHit: number;
+  /** Price per 1M cache-miss input tokens (peak rate). */
+  cacheMiss: number;
+  /** Price per 1M output tokens (peak rate). */
+  output: number;
+}
+
+interface SpendingConfig {
+  enabled: boolean;
+  /** Currency the prices are quoted in. */
+  currency: string;
+  /** Multiplier applied to the peak prices outside peak hours (DeepSeek: 0.5). */
+  offPeakMultiplier: number;
+  /** Peak windows in UTC, e.g. [["01:00", "04:00"], ["06:00", "10:00"]]. */
+  peakWindowsUtc: [string, string][];
+  /** Weekdays that can be peak, e.g. ["Mon", ..., "Fri"]. */
+  peakWeekdays: string[];
+  /** Public holidays (YYYY-MM-DD, UTC) that are always off-peak. */
+  holidays: string[];
+  /** Prices keyed by model id; a key also matches when the model id contains it. */
+  models: Record<string, ModelPrice>;
+}
+
+interface BalanceConfig {
+  url: string;
+  keyName: string;
+  /** Env file holding the key, e.g. "~/.pi/keys/ds.env". */
+  envFile: string;
+  /** Show the balance in this currency (e.g. "CNY"); defaults to the API currency. */
+  currency?: string;
+  /** Balance below this amount (warning color) in `currency`. */
+  low?: number;
+  /** Balance below this amount (error color) in `currency`. */
+  critical?: number;
+  /** Emoji shown before the provider name in the footer. */
+  emoji?: string;
+  /** Label before the session spend in the footer; defaults to 💸. */
+  spentLabel?: string;
+}
+
+interface ProviderConfig {
+  balance?: BalanceConfig;
+  spending?: SpendingConfig;
+}
+
+interface StatsConfig {
+  /** Display currency for balance and spending. */
+  currency: string;
+  /** How long fetched FX rates stay valid, in minutes. */
+  fxCacheMinutes?: number;
+  /** Keep spend and balance across reloads and sessions. */
+  persistence?: PersistenceConfig;
+  providers: Record<string, ProviderConfig>;
+}
+
+interface PersistenceConfig {
+  enabled: boolean;
+  /** State file path; defaults to ~/.pi/token-stats-state.json. */
+  path?: string;
+}
+
+interface PersistedBalance {
+  currency: string;
+  total: number;
+  at: number;
+}
+
+interface PersistedSession {
+  spend: number;
+  currency: string;
+  updatedAt: number;
+}
+
+interface PersistedState {
+  version: 1;
+  sessions: Record<string, PersistedSession>;
+  balances: Record<string, PersistedBalance>;
+}
+
+interface BalanceInfo {
+  currency: string;
+  total: number;
+}
+
+interface FxRate {
+  rate: number;
+  at: number;
 }
 
 // ─── Formatting ──────────────────────────────────────────────────────────────
@@ -173,6 +282,130 @@ function safeUsage(message: any) {
   };
 }
 
+// ─── Balance / spending ──────────────────────────────────────────────────────
+
+const CONFIG_PATH =
+  process.env.PI_TOKEN_STATS_CONFIG ?? join(homedir(), ".pi", "token-stats.json");
+
+const STATUS_KEY = "token-stats";
+const FX_URL = "https://api.frankfurter.dev/v1/latest";
+const FETCH_TIMEOUT_MS = 8000;
+
+function currencySymbol(code: string): string {
+  switch (code.toUpperCase()) {
+    case "EUR":
+      return "€";
+    case "USD":
+      return "$";
+    case "CNY":
+      return "¥";
+    case "GBP":
+      return "£";
+    default:
+      return `${code} `;
+  }
+}
+
+/** Compact money formatting: rounded decimals, `<` for tiny non-zero values. */
+function formatMoney(value: number, code: string, decimals = 3): string {
+  const sym = currencySymbol(code);
+  if (!Number.isFinite(value)) return `${sym}?`;
+
+  const scale = 10 ** decimals;
+  const rounded = Math.round(value * scale) / scale;
+  const smallest = (1 / scale).toFixed(decimals);
+
+  if (value > 0 && rounded === 0) return `${sym}<${smallest}`;
+  if (value < 0 && rounded === 0) return `-${sym}<${smallest}`;
+  return `${sym}${rounded.toFixed(decimals)}`;
+}
+
+/** Spend below this amount (display currency) is shown in cents. */
+const CENTS_THRESHOLD = 0.1;
+
+function formatCents(value: number): string {
+  const rounded = Math.round(value * 100 * 100) / 100;
+  if (value > 0 && rounded === 0) return "<0.01¢";
+  return `${rounded.toFixed(2)}¢`;
+}
+
+function expandHome(file: string): string {
+  if (file === "~") return homedir();
+  if (file.startsWith("~/")) return join(homedir(), file.slice(2));
+  return file;
+}
+
+function parseHttpsUrl(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read a single KEY=VALUE entry from an env file, falling back to process.env. */
+function readApiKey(envFile: string, keyName: string): string | undefined {
+  try {
+    const content = readFileSync(expandHome(envFile), "utf8");
+
+    for (const line of content.split("\n")) {
+      const match = line.match(
+        /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/,
+      );
+      if (!match || match[1] !== keyName) continue;
+      return match[2].trim().replace(/^["']|["']$/g, "");
+    }
+  } catch {
+    /* missing or unreadable env file */
+  }
+
+  return process.env[keyName]?.trim() || undefined;
+}
+
+function parseUtcMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function currentTier(spending: SpendingConfig, now: Date): "peak" | "off-peak" {
+  const day = now.toISOString().slice(0, 10);
+  if (spending.holidays.includes(day)) return "off-peak";
+  if (!spending.peakWeekdays.includes(WEEKDAYS[now.getUTCDay()])) {
+    return "off-peak";
+  }
+
+  const minutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  for (const [start, end] of spending.peakWindowsUtc) {
+    if (minutes >= parseUtcMinutes(start) && minutes < parseUtcMinutes(end)) {
+      return "peak";
+    }
+  }
+
+  return "off-peak";
+}
+
+function priceFor(
+  spending: SpendingConfig,
+  modelId: string,
+): ModelPrice | undefined {
+  if (spending.models[modelId]) return spending.models[modelId];
+
+  let best: ModelPrice | undefined;
+  let bestLength = 0;
+
+  for (const [key, price] of Object.entries(spending.models)) {
+    if (modelId.includes(key) && key.length > bestLength) {
+      best = price;
+      bestLength = key.length;
+    }
+  }
+
+  return best;
+}
+
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function tokenStatsExtension(pi: ExtensionAPI) {
@@ -211,11 +444,358 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     costTotal: 0,
   };
 
+  // ── Balance / spending state ─────────────────────────────────────────────
+
+  let config: StatsConfig | null = null;
+  const balances = new Map<string, BalanceInfo>();
+  const fxRates = new Map<string, FxRate>();
+
+  let activeProvider = "";
+  let activeModel = "";
+
+  let sessionSpend: number | null = null;
+  let agentSpend: number | null = null;
+
+  // Token breakdown of the previous message, used to estimate live spend.
+  let prevInputTokens = 0;
+  let prevCacheReadTokens = 0;
+  let prevCacheWriteTokens = 0;
+
+  let statusRefreshing = false;
+  let statusRefreshQueued = false;
+  let configWarningShown = false;
+
+  let statePath: string | null = null;
+  let state: PersistedState = { version: 1, sessions: {}, balances: {} };
+
+  // ── Config / HTTP ────────────────────────────────────────────────────────
+
+  function loadConfig(ctx: ExtensionContext) {
+    try {
+      config = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as StatsConfig;
+      config.currency = config.currency || "EUR";
+    } catch (error) {
+      config = null;
+      const code = (error as { code?: string })?.code;
+      if (code !== "ENOENT" && !configWarningShown) {
+        configWarningShown = true;
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(
+          `token-stats: cannot read ${CONFIG_PATH}: ${message}`,
+          "warning",
+        );
+      }
+    }
+  }
+
+  async function getRate(from: string, to: string): Promise<number | null> {
+    if (from === to) return 1;
+    if (!config) return null;
+    if (!/^[A-Z]{3}$/.test(from) || !/^[A-Z]{3}$/.test(to)) return null;
+
+    const key = `${from}:${to}`;
+    const cached = fxRates.get(key);
+    const ttlMs = (config.fxCacheMinutes ?? 60) * 60_000;
+    if (cached && Date.now() - cached.at < ttlMs) return cached.rate;
+
+    try {
+      const url = new URL(FX_URL);
+      url.searchParams.set("base", from);
+      url.searchParams.set("symbols", to);
+
+      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (!res.ok) return cached?.rate ?? null;
+
+      const data = (await res.json()) as { rates?: Record<string, number> };
+      const rate = data.rates?.[to];
+      if (typeof rate !== "number") return cached?.rate ?? null;
+
+      fxRates.set(key, { rate, at: Date.now() });
+      return rate;
+    } catch {
+      return cached?.rate ?? null;
+    }
+  }
+
+  async function fetchBalance(balance: BalanceConfig): Promise<BalanceInfo | null> {
+    const key = readApiKey(balance.envFile, balance.keyName);
+    if (!key) return null;
+
+    // The URL comes from the user's own token-stats.json, not from model input.
+    const endpoint = parseHttpsUrl(balance.url);
+    if (!endpoint) return null;
+
+    try {
+      // pi-lens-ignore: ts-ssrf -- endpoint is validated as https above and read from the local user config
+      const res = await fetch(endpoint, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) return null;
+
+      const data = (await res.json()) as {
+        balance_infos?: { currency: string; total_balance: string }[];
+      };
+      const infos = data.balance_infos ?? [];
+      const info =
+        infos.find((i) => i.currency === balance.currency) ??
+        infos.find((i) => i.currency === "CNY") ??
+        infos[0];
+      const total = Number(info?.total_balance);
+
+      if (!info || !Number.isFinite(total)) return null;
+      return { currency: info.currency, total };
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Spend accounting ─────────────────────────────────────────────────────
+
+  /** Convert with an already-cached FX rate; null when the rate is missing. */
+  function convert(amount: number, from: string, to: string): number | null {
+    if (from === to) return amount;
+    const rate = fxRates.get(`${from}:${to}`)?.rate;
+    return rate == null ? null : amount * rate;
+  }
+
+  /** Cost of one message in the display currency, or null when not priced. */
+  async function messageCost(
+    provider: string,
+    modelId: string,
+    usage: ReturnType<typeof safeUsage>,
+  ): Promise<{ amount: number; tier: "peak" | "off-peak" } | null> {
+    const spending = config?.providers?.[provider]?.spending;
+    const displayCurrency = config?.currency;
+    if (!spending?.enabled || !displayCurrency) return null;
+
+    const price = priceFor(spending, modelId);
+    if (!price) return null;
+
+    const tier = currentTier(spending, new Date());
+    const factor = tier === "peak" ? 1 : (spending.offPeakMultiplier ?? 1);
+
+    const raw =
+      (usage.cacheRead * price.cacheHit +
+        (usage.input + usage.cacheWrite) * price.cacheMiss +
+        usage.output * price.output) /
+      1_000_000;
+
+    const rate = await getRate(spending.currency, displayCurrency);
+    if (rate == null) return null;
+
+    return { amount: raw * factor * rate, tier };
+  }
+
+  /** Rough spend of the in-flight message: previous prefill + estimated output. */
+  function estimateLiveSpend(): { amount: number; tier: "peak" | "off-peak" } | null {
+    const spending = config?.providers?.[activeProvider]?.spending;
+    const displayCurrency = config?.currency;
+    if (!spending?.enabled || !displayCurrency || !liveStats) return null;
+
+    const price = priceFor(spending, activeModel);
+    if (!price) return null;
+
+    const tier = currentTier(spending, new Date());
+    const factor = tier === "peak" ? 1 : (spending.offPeakMultiplier ?? 1);
+
+    const raw =
+      (prevCacheReadTokens * price.cacheHit +
+        (prevInputTokens + prevCacheWriteTokens) * price.cacheMiss +
+        liveStats.estimatedOutputTokens * price.output) /
+      1_000_000;
+
+    const amount = convert(raw * factor, spending.currency, displayCurrency);
+    return amount == null ? null : { amount, tier };
+  }
+
+  // ── Status line ──────────────────────────────────────────────────────────
+
+  function balanceColor(
+    balance: BalanceConfig | undefined,
+    amount: number,
+  ): "error" | "warning" | "accent" {
+    if (balance?.critical != null && amount < balance.critical) return "error";
+    if (balance?.low != null && amount < balance.low) return "warning";
+    return "accent";
+  }
+
+  function setStatusLine(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+
+    const providerConfig = config?.providers?.[activeProvider];
+    if (!providerConfig || !config) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      return;
+    }
+
+    const displayCurrency = config.currency;
+    const theme = ctx.ui.theme;
+    const chunks: string[] = [];
+
+    const balance = balances.get(activeProvider);
+    if (balance) {
+      const shownCurrency = providerConfig.balance?.currency || balance.currency;
+      const primary = convert(balance.total, balance.currency, shownCurrency);
+
+      if (primary != null) {
+        const secondary = convert(primary, shownCurrency, displayCurrency);
+        const converted =
+          secondary == null
+            ? ""
+            : theme.fg("dim", ` (${formatMoney(secondary, displayCurrency, 2)})`);
+        chunks.push(
+          theme.fg(balanceColor(providerConfig.balance, primary), formatMoney(primary, shownCurrency, 2)) +
+            converted,
+        );
+      }
+    }
+
+    if (sessionSpend != null) {
+      const spentLabel = providerConfig.balance?.spentLabel ?? "💸";
+      chunks.push(theme.fg("dim", `${spentLabel} ${formatSpend(sessionSpend, null)}`));
+    }
+
+    const spending = providerConfig.spending;
+    if (spending?.enabled) {
+      const tier = currentTier(spending, new Date());
+      chunks.push(theme.fg(tier === "peak" ? "warning" : "success", tier));
+    }
+
+    if (chunks.length === 0) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      return;
+    }
+
+    const separator = theme.fg("dim", " · ");
+    const label = theme.fg(
+      "dim",
+      `${providerConfig.balance?.emoji ? `${providerConfig.balance.emoji} ` : ""}${activeProvider} `,
+    );
+    ctx.ui.setStatus(STATUS_KEY, label + chunks.join(separator));
+  }
+
+  /** Refresh balance + FX, then redraw the footer line. Coalesces concurrent calls. */
+  function refreshStatus(ctx: ExtensionContext) {
+    if (!ctx.hasUI) return;
+
+    if (statusRefreshing) {
+      statusRefreshQueued = true;
+      return;
+    }
+
+    const balanceConfig = config?.providers?.[activeProvider]?.balance;
+    if (!config || !balanceConfig) {
+      setStatusLine(ctx);
+      return;
+    }
+
+    const displayCurrency = config.currency;
+    statusRefreshing = true;
+    const provider = activeProvider;
+
+    void (async () => {
+      try {
+        do {
+          statusRefreshQueued = false;
+
+          const balance = await fetchBalance(balanceConfig);
+          if (balance) {
+            balances.set(provider, balance);
+            saveState(ctx);
+          }
+
+          if (balance) {
+            const shownCurrency = balanceConfig.currency || balance.currency;
+            await getRate(balance.currency, shownCurrency);
+            await getRate(shownCurrency, displayCurrency);
+          }
+        } while (statusRefreshQueued);
+      } finally {
+        statusRefreshing = false;
+        setStatusLine(ctx);
+      }
+    })();
+  }
+
+  // ── Persistence ──────────────────────────────────────────────────────────
+
+  function sessionId(ctx: ExtensionContext): string | null {
+    try {
+      return ctx.sessionManager.getSessionId();
+    } catch {
+      return null;
+    }
+  }
+
+  function loadPersistedState(ctx: ExtensionContext) {
+    const persistence = config?.persistence;
+    statePath = persistence?.enabled
+      ? expandHome(persistence.path ?? join(homedir(), ".pi", "token-stats-state.json"))
+      : null;
+    state = { version: 1, sessions: {}, balances: {} };
+    if (!statePath) return;
+
+    try {
+      const saved = JSON.parse(readFileSync(statePath, "utf8")) as PersistedState;
+      state = {
+        version: 1,
+        sessions: saved.sessions ?? {},
+        balances: saved.balances ?? {},
+      };
+    } catch {
+      return;
+    }
+
+    for (const [provider, balance] of Object.entries(state.balances)) {
+      balances.set(provider, { currency: balance.currency, total: balance.total });
+    }
+
+    const id = sessionId(ctx);
+    const savedSession = id ? state.sessions[id] : undefined;
+    if (savedSession && savedSession.currency === config?.currency) {
+      sessionSpend = savedSession.spend;
+    }
+  }
+
+  function saveState(ctx: ExtensionContext) {
+    if (!statePath || !config) return;
+
+    const id = sessionId(ctx);
+    if (id && sessionSpend != null) {
+      state.sessions[id] = {
+        spend: sessionSpend,
+        currency: config.currency,
+        updatedAt: Date.now(),
+      };
+    }
+
+    for (const [provider, balance] of balances) {
+      state.balances[provider] = { ...balance, at: Date.now() };
+    }
+
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    state.sessions = Object.fromEntries(
+      Object.entries(state.sessions)
+        .filter(([, entry]) => entry.updatedAt >= cutoff)
+        .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+        .slice(0, 100),
+    );
+
+    try {
+      writeFileSync(`${statePath}.tmp`, JSON.stringify(state));
+      renameSync(`${statePath}.tmp`, statePath);
+    } catch {
+      /* ignore unwritable state file */
+    }
+  }
+
   // ── Agent lifecycle ──────────────────────────────────────────────────────
 
   pi.on("agent_start", (_event, _ctx) => {
     agentStartedAt = Date.now();
     agentActive = true;
+    agentSpend = null;
 
     agentInputTokens = 0;
     agentOutputTokens = 0;
@@ -258,6 +838,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       totalTokens: agentTotalTokens,
       costTotal: agentCostTotal,
       messages: agentAssistantMessages,
+      spend: agentSpend,
     };
 
     agentActive = false;
@@ -292,7 +873,12 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       generationTimeMs: 0,
       estimatedOutputTokens: 0,
       generationTokensPerSecond: 0,
+      spend: null,
+      tier: null,
     };
+
+    activeProvider = event.message.provider;
+    activeModel = event.message.model;
 
     showWorkingIndicator(ctx);
   });
@@ -336,10 +922,14 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       liveStats.generationTimeMs,
     );
 
+    const liveEstimate = estimateLiveSpend();
+    liveStats.spend = liveEstimate?.amount ?? null;
+    liveStats.tier = liveEstimate?.tier ?? null;
+
     showWorkingIndicator(ctx);
   });
 
-  pi.on("message_end", (event, ctx) => {
+  pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
 
     const now = Date.now();
@@ -377,9 +967,28 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       totalTokens: usage.totalTokens,
       costTotal: usage.costTotal,
       stopReason: event.message.stopReason ?? "unknown",
+      spend: null,
+      tier: null,
     };
 
     liveStats = null;
+    activeProvider = event.message.provider;
+    activeModel = event.message.model;
+
+    const cost = await messageCost(activeProvider, activeModel, usage);
+    finalStats.spend = cost?.amount ?? null;
+    finalStats.tier = cost?.tier ?? null;
+    if (cost) {
+      // Raw amounts: rounding happens only when a line is rendered.
+      sessionSpend = (sessionSpend ?? 0) + cost.amount;
+      agentSpend = (agentSpend ?? 0) + cost.amount;
+    }
+
+    prevInputTokens = usage.input;
+    prevCacheReadTokens = usage.cacheRead;
+    prevCacheWriteTokens = usage.cacheWrite;
+
+    saveState(ctx);
 
     addToSessionTotals(finalStats);
     addToAgentTotals(finalStats);
@@ -421,6 +1030,9 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
     lastMessageNotifyText = renderFinalPlain(finalStats);
     ctx.ui.notify(lastMessageNotifyText, "info");
+
+    setStatusLine(ctx);
+    refreshStatus(ctx);
   });
 
   // ── Session lifecycle ────────────────────────────────────────────────────
@@ -430,10 +1042,29 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     finalStats = null;
     lastMessageNotifyText = "";
 
+    loadConfig(ctx);
+    balances.clear();
+    fxRates.clear();
+
+    activeProvider = "";
+    activeModel = "";
+    sessionSpend = null;
+    agentSpend = null;
+    prevInputTokens = 0;
+    prevCacheReadTokens = 0;
+    prevCacheWriteTokens = 0;
+
+    loadPersistedState(ctx);
+
+    activeProvider = ctx.model?.provider ?? "";
+    activeModel = ctx.model?.id ?? "";
+
     resetSessionTotals();
     resetAgentTotals();
 
     resetWorkingIndicator(ctx);
+    setStatusLine(ctx);
+    refreshStatus(ctx);
   });
 
   pi.on("turn_start", (_event, ctx) => {
@@ -443,10 +1074,12 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    saveState(ctx);
     liveStats = null;
     finalStats = null;
     agentActive = false;
     resetWorkingIndicator(ctx);
+    if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 
   // ── Totals ───────────────────────────────────────────────────────────────
@@ -506,7 +1139,42 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   // ── Rendering ────────────────────────────────────────────────────────────
 
+  function formatSpend(
+    value: number,
+    tier: "peak" | "off-peak" | null,
+    approximate = false,
+  ): string {
+    const money = `${approximate ? "~" : ""}${formatMoney(value, config?.currency ?? "EUR")}`;
+    return tier ? `${money} ${tier}` : money;
+  }
+
+  /** Small spends render as cents; `withFull` adds the 3-decimal currency value. */
+  function formatSpendCents(value: number, withFull: boolean, approximate = false): string {
+    const currency = config?.currency ?? "EUR";
+    const prefix = approximate ? "~" : "";
+
+    if (value >= CENTS_THRESHOLD) return `${prefix}${formatMoney(value, currency)}`;
+
+    const cents = `${prefix}${formatCents(value)}`;
+    return withFull ? `${cents} (${formatMoney(value, currency)})` : cents;
+  }
+
+  function formatSpendLine(
+    value: number,
+    withFull: boolean,
+    approximate: boolean,
+    tier: "peak" | "off-peak" | null,
+  ): string {
+    const amount = formatSpendCents(value, withFull, approximate);
+    return tier ? `${amount} ${tier}` : amount;
+  }
+
   function renderFinalPlain(stats: FinalStats): string {
+    let spendSuffix = "";
+    if (stats.spend != null) {
+      spendSuffix = ` · ${formatSpendLine(stats.spend, true, false, stats.tier)}`;
+    }
+
     return [
       stats.model,
       "✓",
@@ -525,13 +1193,16 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       "·",
       `Cache R${formatTokens(stats.cacheReadTokens)} W${formatTokens(
         stats.cacheWriteTokens,
-      )}`,
+      )}${spendSuffix}`,
     ].join(" ");
   }
 
   function renderAgentPlain(stats: AgentStats): string {
-    const messageSuffix =
-      stats.messages > 1 ? ` · ${stats.messages} responses` : "";
+    const suffixes = [
+      stats.spend == null ? "" : formatSpend(stats.spend, null),
+      stats.messages > 1 ? `${stats.messages} responses` : "",
+    ].filter(Boolean);
+    const suffix = suffixes.length > 0 ? ` · ${suffixes.join(" · ")}` : "";
 
     return [
       stats.label,
@@ -551,7 +1222,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       "·",
       `Cache R${formatTokens(stats.cacheReadTokens)} W${formatTokens(
         stats.cacheWriteTokens,
-      )}${messageSuffix}`,
+      )}${suffix}`,
     ].join(" ");
   }
 
@@ -560,6 +1231,11 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       stats.prefillTimeMs > 0
         ? stats.prefillTimeMs + stats.generationTimeMs
         : stats.generationTimeMs;
+
+    const spendParts =
+      stats.spend == null
+        ? []
+        : ["·", formatSpendCents(stats.spend, false, true)];
 
     return [
       stats.model,
@@ -572,6 +1248,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       `↓${formatTokens(stats.estimatedOutputTokens)} @ ${formatRateNumber(
         stats.generationTokensPerSecond,
       )}/s`,
+      ...spendParts,
     ].join(" ");
   }
 
