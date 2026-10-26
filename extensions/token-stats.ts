@@ -13,6 +13,7 @@
  * - Shows provider balance in the footer through ctx.ui.setStatus()
  * - Shows spend on the live, message, and agent stats lines
  * - Optionally persists session spend and balance across reloads
+ * - Optionally stores stats lines in the session to restore them after reload
  *
  * Message format:
  * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) off-peak · 💰 $1.68 (€1.50)
@@ -30,8 +31,11 @@
  */
 
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { Text } from "@earendil-works/pi-tui";
 
 import type {
   ExtensionAPI,
@@ -169,6 +173,16 @@ interface PersistenceConfig {
   enabled: boolean;
   /** State file path; defaults to ~/.pi/token-stats-state.json. */
   path?: string;
+  /** Store stats lines in the session so they return after a reload. */
+  lines?: boolean;
+}
+
+interface StatsLineEntry {
+  /** Extension runtime that wrote the entry. */
+  boot: string;
+  kind: "message" | "agent";
+  line: string;
+  at: number;
 }
 
 interface PersistedBalance {
@@ -290,6 +304,7 @@ const CONFIG_PATH =
   process.env.PI_TOKEN_STATS_CONFIG ?? join(homedir(), ".pi", "token-stats.json");
 
 const STATUS_KEY = "token-stats";
+const STATS_LINE_TYPE = "token-stats-line";
 const FX_URL = "https://api.frankfurter.dev/v1/latest";
 const FETCH_TIMEOUT_MS = 8000;
 
@@ -411,6 +426,20 @@ function priceFor(
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function tokenStatsExtension(pi: ExtensionAPI) {
+  // Identifies this extension runtime. Entries written here stay hidden and
+  // live output comes from notify(); after a reload a new runtime renders them
+  // as history, so only lines lost with the previous runtime reappear.
+  const bootId = randomUUID();
+
+  pi.registerEntryRenderer<StatsLineEntry>(
+    STATS_LINE_TYPE,
+    (entry, _options, theme) => {
+      const data = entry.data;
+      if (!data || data.boot === bootId) return undefined;
+      return new Text(theme.fg("dim", data.line), 0, 0);
+    },
+  );
+
   let requestSentAt = 0;
   let firstTokenAt = 0;
 
@@ -770,6 +799,18 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     }
   }
 
+  /** Store a stats line as a session entry so later runtimes render it. */
+  function appendLineEntry(kind: StatsLineEntry["kind"], line: string) {
+    if (!config?.persistence?.lines) return;
+
+    pi.appendEntry<StatsLineEntry>(STATS_LINE_TYPE, {
+      boot: bootId,
+      kind,
+      line,
+      at: Date.now(),
+    });
+  }
+
   // ── Agent lifecycle ──────────────────────────────────────────────────────
 
   pi.on("agent_start", (_event, _ctx) => {
@@ -831,6 +872,8 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     } else {
       ctx.ui.notify(agentNotifyText, "info");
     }
+
+    appendLineEntry("agent", agentNotifyText);
   });
 
   // ── Provider/message lifecycle ───────────────────────────────────────────
@@ -1017,6 +1060,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
     lastMessageNotifyText = renderFinalPlain(finalStats);
     ctx.ui.notify(lastMessageNotifyText, "info");
+    appendLineEntry("message", lastMessageNotifyText);
   });
 
   // ── Session lifecycle ────────────────────────────────────────────────────
