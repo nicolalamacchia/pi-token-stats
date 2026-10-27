@@ -114,6 +114,7 @@ run `/reload` after editing it.
         "enabled": true,
         "currency": "USD",
         "offPeakMultiplier": 0.5,
+        "showTierUntil": true,
         "peakWeekdays": ["Mon", "Tue", "Wed", "Thu", "Fri"],
         "peakWindowsUtc": [["01:00", "04:00"], ["06:00", "10:00"]],
         "holidays": ["2026-01-01", "2026-02-15"],
@@ -132,6 +133,11 @@ rate; `offPeakMultiplier` is applied outside peak hours. Model keys match a
 model id exactly or as a substring (longest key wins), so aliases such as
 `deepseek-v4-flash` can map to the same prices. Without a matching price the
 spend part is hidden.
+
+`showTierUntil` (default `true`) appends the end of the current tier in local
+time: `off-peak (until 07:00)` today, `off-peak (until Mon 02:00)` within a
+week, `off-peak (until 2026-01-19 02:00)` further out. Set it to `false` to
+show the bare tier.
 
 The API key is read from `envFile` (first `KEY=VALUE` match) and falls back to
 the process environment. `balance.currency` is the currency shown first
