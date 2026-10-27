@@ -16,7 +16,7 @@
  * - Optionally stores stats lines in the session to restore them after reload
  *
  * Message format:
- * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) off-peak · 💰 $1.68 (€1.50)
+ * IBM/Granite4-7B-A1B-H ✓ 17.9s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) off-peak (until 07:00) · 💰 $1.68 (€1.50)
  *
  * Agent-end notify format:
  * <last message stats>
@@ -24,7 +24,7 @@
  * Agent ✓ 20.1s (↑15.6s + ↓2.3s) · ↑9.8k @ 625.5/s · ↓114 @ 49.9/s · Cache R2.0k W0 · 0.13¢ (€0.001) · 💰 $1.68 (€1.50)
  *
  * Footer line (configured providers only):
- * 💰 deepseek $1.67 (€1.59) · 💸 €0.081 · off-peak
+ * 💰 deepseek $1.67 (€1.59) · 💸 €0.081 · off-peak (until 07:00)
  *
  * Usage:
  * pi -e ./token-stats.ts
@@ -125,6 +125,8 @@ interface SpendingConfig {
   currency: string;
   /** Multiplier applied to the peak prices outside peak hours (DeepSeek: 0.5). */
   offPeakMultiplier: number;
+  /** Show when the current tier ends, e.g. "off-peak (until 01:00)"; defaults to true. */
+  showTierUntil?: boolean;
   /** Peak windows in UTC, e.g. [["01:00", "04:00"], ["06:00", "10:00"]]. */
   peakWindowsUtc: [string, string][];
   /** Weekdays that can be peak, e.g. ["Mon", ..., "Fri"]. */
@@ -402,6 +404,79 @@ function currentTier(spending: SpendingConfig, now: Date): "peak" | "off-peak" {
   }
 
   return "off-peak";
+}
+
+const DAY_MS = 86_400_000;
+
+function utcMinutesOfDay(date: Date): number {
+  return date.getUTCHours() * 60 + date.getUTCMinutes();
+}
+
+/** UTC midnight of the day containing `date`. */
+function utcDayStart(date: Date): number {
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
+
+/** First peak-window start strictly after `now`; null when none in 14 days. */
+function nextPeakStart(spending: SpendingConfig, now: Date): Date | null {
+  const nowMinutes = utcMinutesOfDay(now);
+  const today = utcDayStart(now);
+
+  for (let offset = 0; offset <= 14; offset++) {
+    const dayStart = today + offset * DAY_MS;
+    const day = new Date(dayStart);
+    if (spending.holidays.includes(day.toISOString().slice(0, 10))) continue;
+    if (!spending.peakWeekdays.includes(WEEKDAYS[day.getUTCDay()])) continue;
+
+    const starts = spending.peakWindowsUtc
+      .map(([start]) => parseUtcMinutes(start))
+      .filter((minutes) => offset > 0 || minutes > nowMinutes)
+      .sort((a, b) => a - b);
+
+    if (starts.length > 0) {
+      return new Date(dayStart + starts[0] * 60_000);
+    }
+  }
+
+  return null;
+}
+
+/** Instant at which the tier in effect at `now` ends, or null when unknown. */
+function tierUntil(spending: SpendingConfig, now: Date): Date | null {
+  if (currentTier(spending, now) === "off-peak") {
+    return nextPeakStart(spending, now);
+  }
+
+  const minutes = utcMinutesOfDay(now);
+  let end: number | null = null;
+
+  for (const [start, stop] of spending.peakWindowsUtc) {
+    if (minutes >= parseUtcMinutes(start) && minutes < parseUtcMinutes(stop)) {
+      const candidate = parseUtcMinutes(stop);
+      if (end == null || candidate < end) end = candidate;
+    }
+  }
+
+  return end == null ? null : new Date(utcDayStart(now) + end * 60_000);
+}
+
+/** Local-time rendering of a boundary: "04:00" today, "Mon 01:00" within a
+ * week, "2026-01-19 01:00" further out (weekdays repeat and get ambiguous). */
+function formatUntilLocal(at: Date, now: Date): string {
+  const hh = String(at.getHours()).padStart(2, "0");
+  const mm = String(at.getMinutes()).padStart(2, "0");
+  const time = `${hh}:${mm}`;
+
+  const atDay = Date.UTC(at.getFullYear(), at.getMonth(), at.getDate());
+  const nowDay = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  const days = Math.round((atDay - nowDay) / DAY_MS);
+
+  if (days === 0) return time;
+  if (days < 7) return `${WEEKDAYS[at.getDay()]} ${time}`;
+
+  const month = String(at.getMonth() + 1).padStart(2, "0");
+  const day = String(at.getDate()).padStart(2, "0");
+  return `${at.getFullYear()}-${month}-${day} ${time}`;
 }
 
 function priceFor(
@@ -688,7 +763,9 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     const spending = providerConfig.spending;
     if (spending?.enabled) {
       const tier = currentTier(spending, new Date());
-      chunks.push(theme.fg(tier === "peak" ? "warning" : "success", tier));
+      chunks.push(
+        theme.fg(tier === "peak" ? "warning" : "success", tierText(tier)),
+      );
     }
 
     if (chunks.length === 0) {
@@ -1167,13 +1244,25 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   // ── Rendering ────────────────────────────────────────────────────────────
 
+  /** Tier text plus its local-time end when `showTierUntil` is on (default). */
+  function tierText(tier: "peak" | "off-peak"): string {
+    const spending = config?.providers?.[activeProvider]?.spending;
+    if (!spending || spending.showTierUntil === false) return tier;
+
+    const now = new Date();
+    if (currentTier(spending, now) !== tier) return tier;
+
+    const until = tierUntil(spending, now);
+    return until ? `${tier} (until ${formatUntilLocal(until, now)})` : tier;
+  }
+
   function formatSpend(
     value: number,
     tier: "peak" | "off-peak" | null,
     approximate = false,
   ): string {
     const money = `${approximate ? "~" : ""}${formatMoney(value, config?.currency ?? "EUR")}`;
-    return tier ? `${money} ${tier}` : money;
+    return tier ? `${money} ${tierText(tier)}` : money;
   }
 
   /** Small spends render as cents; `withFull` adds the 3-decimal currency value. */
@@ -1194,7 +1283,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     tier: "peak" | "off-peak" | null,
   ): string {
     const amount = formatSpendCents(value, withFull, approximate);
-    return tier ? `${amount} ${tier}` : amount;
+    return tier ? `${amount} ${tierText(tier)}` : amount;
   }
 
   /** Balance for notify lines, or "" when `balance.showInMessages` is off. */
