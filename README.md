@@ -1,6 +1,7 @@
 # pi-token-stats
 
-Live token and throughput stats for [pi](https://pi.dev).
+Live token and throughput stats for [pi](https://pi.dev) and
+[omp](https://github.com/can1357/oh-my-pi).
 
 While the model is streaming, pi's working indicator shows estimated output tokens and generation speed:
 
@@ -89,7 +90,8 @@ time-of-day discounts apply.
 ## Configuration
 
 Balance and spend are opt-in. The extension reads `~/.pi/token-stats.json`
-(override with `PI_TOKEN_STATS_CONFIG`). The file is read at session start, so
+(`~/.omp/token-stats.json` under omp; override with `PI_TOKEN_STATS_CONFIG`).
+The file is read at session start, so
 run `/reload` after editing it.
 
 ```json
@@ -151,7 +153,8 @@ value right after that response.
 
 `persistence` is off by default. When enabled, the extension keeps the
 session spend and the last balance per provider in
-`~/.pi/token-stats-state.json` (override with `persistence.path`), written on
+`~/.pi/token-stats-state.json` (`~/.omp/token-stats-state.json` under omp;
+override with `persistence.path`), written on
 every message and on shutdown. Sessions idle for more than 30 days are pruned;
 the file keeps at most 100 sessions.
 
@@ -161,6 +164,8 @@ output still comes from the notification only: an entry stays hidden in the
 runtime that wrote it. A later runtime (reload, resume) has a different id and
 renders the entry in place, so lines lost to a reload return to the
 transcript. Entries need a persisted session and interactive mode to render.
+omp has no entry renderers, so there the lines stay hidden and only the
+notifications show.
 
 DeepSeek prices and peak windows are from
 [api-docs.deepseek.com](https://api-docs.deepseek.com/quick_start/pricing):
@@ -193,6 +198,16 @@ pi -e ./extensions/token-stats.ts
 ```
 
 The extension can also be copied directly into `~/.pi/agent/extensions/`.
+
+Under omp, install the same package with its plugin manager:
+
+```bash
+omp plugin install /path/to/pi-token-stats   # or the git spec
+```
+
+One file serves both hosts: it detects omp at load time (omp has no
+`registerEntryRenderer`), then uses `setWorkingMessage` instead of
+`setWorkingIndicator` and keeps its config and state under `~/.omp`.
 
 ## License
 

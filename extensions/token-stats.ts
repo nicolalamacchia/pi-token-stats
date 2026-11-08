@@ -7,7 +7,7 @@
  * - No custom renderer
  * - No widget
  * - No commands
- * - Shows live progress through ctx.ui.setWorkingIndicator()
+ * - Shows live progress through ctx.ui.setWorkingIndicator() (ctx.ui.setWorkingMessage() under omp)
  * - Shows finalized message stats through ctx.ui.notify()
  * - Shows finalized agent stats on agent_end through ctx.ui.notify()
  * - Shows provider balance in the footer through ctx.ui.setStatus()
@@ -302,8 +302,21 @@ function safeUsage(message: any) {
 
 // ─── Balance / spending ──────────────────────────────────────────────────────
 
-const CONFIG_PATH =
-  process.env.PI_TOKEN_STATS_CONFIG ?? join(homedir(), ".pi", "token-stats.json");
+/**
+ * pi exposes `ctx.ui.setWorkingIndicator` and `pi.registerEntryRenderer`.
+ * omp loads pi packages through a compatibility shim that has neither: it
+ * exposes `ctx.ui.setWorkingMessage` instead. Every host branch keys off this.
+ */
+let isOmpHost = false;
+
+/** Agent config root: `~/.pi` under pi, `~/.omp` under omp. */
+function statsRootDir(): string {
+  return join(homedir(), isOmpHost ? ".omp" : ".pi");
+}
+
+function configPath(): string {
+  return process.env.PI_TOKEN_STATS_CONFIG ?? join(statsRootDir(), "token-stats.json");
+}
 
 const STATUS_KEY = "token-stats";
 const STATS_LINE_TYPE = "token-stats-line";
@@ -501,19 +514,24 @@ function priceFor(
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function tokenStatsExtension(pi: ExtensionAPI) {
+  isOmpHost = typeof pi.registerEntryRenderer !== "function";
+
   // Identifies this extension runtime. Entries written here stay hidden and
   // live output comes from notify(); after a reload a new runtime renders them
   // as history, so only lines lost with the previous runtime reappear.
   const bootId = randomUUID();
 
-  pi.registerEntryRenderer<StatsLineEntry>(
-    STATS_LINE_TYPE,
-    (entry, _options, theme) => {
-      const data = entry.data;
-      if (!data || data.boot === bootId) return undefined;
-      return new Text(theme.fg("dim", data.line), 0, 0);
-    },
-  );
+  // omp has no entry renderers; its stats lines are plain session entries.
+  if (typeof pi.registerEntryRenderer === "function") {
+    pi.registerEntryRenderer<StatsLineEntry>(
+      STATS_LINE_TYPE,
+      (entry, _options, theme) => {
+        const data = entry.data;
+        if (!data || data.boot === bootId) return undefined;
+        return new Text(theme.fg("dim", data.line), 0, 0);
+      },
+    );
+  }
 
   let requestSentAt = 0;
   let firstTokenAt = 0;
@@ -576,7 +594,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   function loadConfig(ctx: ExtensionContext) {
     try {
-      config = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as StatsConfig;
+      config = JSON.parse(readFileSync(configPath(), "utf8")) as StatsConfig;
       config.currency = config.currency || "EUR";
     } catch (error) {
       config = null;
@@ -585,7 +603,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         configWarningShown = true;
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(
-          `token-stats: cannot read ${CONFIG_PATH}: ${message}`,
+          `token-stats: cannot read ${configPath()}: ${message}`,
           "warning",
         );
       }
@@ -817,7 +835,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   function loadPersistedState(ctx: ExtensionContext) {
     const persistence = config?.persistence;
     statePath = persistence?.enabled
-      ? expandHome(persistence.path ?? join(homedir(), ".pi", "token-stats-state.json"))
+      ? expandHome(persistence.path ?? join(statsRootDir(), "token-stats-state.json"))
       : null;
     state = { version: 1, sessions: {}, balances: {} };
     if (!statePath) return;
@@ -1395,14 +1413,22 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   function showWorkingIndicator(ctx: ExtensionContext) {
     if (!ctx.hasUI || !liveStats) return;
 
-    ctx.ui.setWorkingIndicator({
-      frames: [renderLivePlain(liveStats)],
-      intervalMs: 250,
-    } as any);
+    const ui = ctx.ui as any;
+    if (typeof ui.setWorkingIndicator === "function") {
+      ui.setWorkingIndicator({ frames: [renderLivePlain(liveStats)], intervalMs: 250 });
+    } else if (typeof ui.setWorkingMessage === "function") {
+      ui.setWorkingMessage(renderLivePlain(liveStats));
+    }
   }
 
   function resetWorkingIndicator(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
-    ctx.ui.setWorkingIndicator(undefined as any);
+
+    const ui = ctx.ui as any;
+    if (typeof ui.setWorkingIndicator === "function") {
+      ui.setWorkingIndicator(undefined);
+    } else if (typeof ui.setWorkingMessage === "function") {
+      ui.setWorkingMessage(undefined);
+    }
   }
 }
