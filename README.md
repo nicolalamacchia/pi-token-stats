@@ -130,6 +130,23 @@ run `/reload` after editing it.
 }
 ```
 
+### Display
+
+`display` controls what the extension draws; missing keys keep the host
+default. pi shows everything; omp shows only the footer balance and the live
+working indicator by default.
+
+```json
+"display": { "notify": true, "entries": true, "spend": true, "tier": true }
+```
+
+- `notify` — finalized message and agent lines through `ctx.ui.notify()`.
+- `entries` — stats lines stored as session entries (needs `persistence.lines`).
+- `spend` — spend in the live indicator, the footer, and the lines.
+- `tier` — peak/off-peak tier in the footer.
+
+The live working indicator is always drawn while a response streams.
+
 Provider keys match `message.provider`. Prices are per 1M tokens at the peak
 rate; `offPeakMultiplier` is applied outside peak hours. Model keys match a
 model id exactly or as a substring (longest key wins), so aliases such as

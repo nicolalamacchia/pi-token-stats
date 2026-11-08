@@ -161,11 +161,24 @@ interface ProviderConfig {
   spending?: SpendingConfig;
 }
 
+interface DisplayConfig {
+  /** Finalized message and agent lines through `ctx.ui.notify()`. */
+  notify?: boolean;
+  /** Stats lines stored as session entries. */
+  entries?: boolean;
+  /** Spend amounts in the live indicator, footer, and lines. */
+  spend?: boolean;
+  /** Peak/off-peak tier in the footer line. */
+  tier?: boolean;
+}
+
 interface StatsConfig {
   /** Display currency for balance and spending. */
   currency: string;
   /** How long fetched FX rates stay valid, in minutes. */
   fxCacheMinutes?: number;
+  /** What the extension draws; missing keys keep the host default. */
+  display?: DisplayConfig;
   /** Keep spend and balance across reloads and sessions. */
   persistence?: PersistenceConfig;
   providers: Record<string, ProviderConfig>;
@@ -317,6 +330,14 @@ function statsRootDir(): string {
 function configPath(): string {
   return process.env.PI_TOKEN_STATS_CONFIG ?? join(statsRootDir(), "token-stats.json");
 }
+
+type ResolvedDisplay = Required<DisplayConfig>;
+
+/** pi shows every line; omp defaults to the balance footer and the live indicator only. */
+const DISPLAY_DEFAULTS: Record<"pi" | "omp", ResolvedDisplay> = {
+  pi: { notify: true, entries: true, spend: true, tier: true },
+  omp: { notify: false, entries: false, spend: false, tier: false },
+};
 
 const STATUS_KEY = "token-stats";
 const STATS_LINE_TYPE = "token-stats-line";
@@ -571,6 +592,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
   // ── Balance / spending state ─────────────────────────────────────────────
 
   let config: StatsConfig | null = null;
+  let display: ResolvedDisplay = { ...DISPLAY_DEFAULTS[isOmpHost ? "omp" : "pi"] };
   const balances = new Map<string, BalanceInfo>();
   const fxRates = new Map<string, FxRate>();
 
@@ -596,8 +618,10 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     try {
       config = JSON.parse(readFileSync(configPath(), "utf8")) as StatsConfig;
       config.currency = config.currency || "EUR";
+      display = { ...DISPLAY_DEFAULTS[isOmpHost ? "omp" : "pi"], ...config.display };
     } catch (error) {
       config = null;
+      display = { ...DISPLAY_DEFAULTS[isOmpHost ? "omp" : "pi"] };
       const code = (error as { code?: string })?.code;
       if (code !== "ENOENT" && !configWarningShown) {
         configWarningShown = true;
@@ -773,13 +797,13 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
       }
     }
 
-    if (sessionSpend != null) {
+    if (sessionSpend != null && display.spend) {
       const spentLabel = providerConfig.balance?.spentLabel ?? "💸";
       chunks.push(theme.fg("dim", `${spentLabel} ${formatSpend(sessionSpend, null)}`));
     }
 
     const spending = providerConfig.spending;
-    if (spending?.enabled) {
+    if (spending?.enabled && display.tier) {
       const tier = currentTier(spending, new Date());
       chunks.push(
         theme.fg(tier === "peak" ? "warning" : "success", tierText(tier)),
@@ -896,7 +920,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   /** Store a stats line as a session entry so later runtimes render it. */
   function appendLineEntry(kind: StatsLineEntry["kind"], line: string) {
-    if (!config?.persistence?.lines) return;
+    if (!config?.persistence?.lines || !display.entries) return;
 
     pi.appendEntry<StatsLineEntry>(STATS_LINE_TYPE, {
       boot: bootId,
@@ -962,10 +986,12 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
     const agentNotifyText = renderAgentPlain(agentStats);
 
-    if (lastMessageNotifyText) {
-      ctx.ui.notify(`${lastMessageNotifyText}\n\n${agentNotifyText}`, "info");
-    } else {
-      ctx.ui.notify(agentNotifyText, "info");
+    if (display.notify) {
+      if (lastMessageNotifyText) {
+        ctx.ui.notify(`${lastMessageNotifyText}\n\n${agentNotifyText}`, "info");
+      } else {
+        ctx.ui.notify(agentNotifyText, "info");
+      }
     }
 
     appendLineEntry("agent", agentNotifyText);
@@ -1154,7 +1180,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
     }
 
     lastMessageNotifyText = renderFinalPlain(finalStats);
-    ctx.ui.notify(lastMessageNotifyText, "info");
+    if (display.notify) ctx.ui.notify(lastMessageNotifyText, "info");
     appendLineEntry("message", lastMessageNotifyText);
   });
 
@@ -1325,7 +1351,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   function renderFinalPlain(stats: FinalStats): string {
     let spendSuffix = "";
-    if (stats.spend != null) {
+    if (stats.spend != null && display.spend) {
       spendSuffix = ` · ${formatSpendLine(stats.spend, true, false, stats.tier)}`;
     }
 
@@ -1356,7 +1382,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
 
   function renderAgentPlain(stats: AgentStats): string {
     const suffixes = [
-      stats.spend == null ? "" : formatSpendCents(stats.spend, true),
+      stats.spend == null || !display.spend ? "" : formatSpendCents(stats.spend, true),
       lineBalance(),
       stats.messages > 1 ? `${stats.messages} responses` : "",
     ].filter(Boolean);
@@ -1391,7 +1417,7 @@ export default function tokenStatsExtension(pi: ExtensionAPI) {
         : stats.generationTimeMs;
 
     const spendParts =
-      stats.spend == null
+      stats.spend == null || !display.spend
         ? []
         : ["·", formatSpendCents(stats.spend, false, true)];
 
